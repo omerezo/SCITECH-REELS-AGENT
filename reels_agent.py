@@ -337,6 +337,7 @@ def generate_ambient_audio(duration, sr=44100):
     stereo = np.column_stack([audio, audio])
 
     def make_frame(t_arr):
+        t_arr = np.atleast_1d(np.asarray(t_arr, dtype=np.float64))
         indices = (t_arr * sr).astype(int)
         indices = np.clip(indices, 0, len(stereo) - 1)
         return stereo[indices]
