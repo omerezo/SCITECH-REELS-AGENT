@@ -712,10 +712,67 @@ def create_reel_video(frame_paths, article_id):
 
 # ── Facebook Reels API ──
 
+def check_reel_status(video_id, max_polls=10, interval=15):
+    """Poll Facebook for video processing status until ready, error, or timeout."""
+    for i in range(max_polls):
+        try:
+            resp = requests.get(
+                f"https://graph.facebook.com/v19.0/{video_id}",
+                params={
+                    "fields": "status,published,title,description,length,source",
+                    "access_token": FB_PAGE_ACCESS_TOKEN,
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            status = data.get("status", {})
+            video_status = status.get("video_status", "unknown")
+            uploading_phase = status.get("uploading_phase", {})
+            processing_phase = status.get("processing_phase", {})
+            publishing_phase = status.get("publishing_phase", {})
+
+            log.info(f"[facebook] status poll {i+1}/{max_polls}: "
+                     f"video_status={video_status}, "
+                     f"uploading={uploading_phase.get('status', '?')}, "
+                     f"processing={processing_phase.get('status', '?')}, "
+                     f"publishing={publishing_phase.get('status', '?')}, "
+                     f"published={data.get('published', '?')}")
+
+            if video_status == "ready":
+                log.info(f"[facebook] ✓ reel is READY and published!")
+                return {"ok": True, "status": "ready", "data": data}
+
+            if video_status == "error":
+                errors = status.get("errors", publishing_phase.get("error", {}))
+                log.error(f"[facebook] ✗ reel FAILED: {errors}")
+                return {"ok": False, "status": "error", "errors": errors, "data": data}
+
+            pub_status = publishing_phase.get("status", "")
+            if pub_status == "error":
+                pub_error = publishing_phase.get("error", {})
+                log.error(f"[facebook] ✗ publishing FAILED: {pub_error}")
+                return {"ok": False, "status": "publish_error", "errors": pub_error, "data": data}
+
+            if pub_status == "complete":
+                log.info(f"[facebook] ✓ publishing complete!")
+                return {"ok": True, "status": "complete", "data": data}
+
+        except Exception as e:
+            log.warning(f"[facebook] status poll {i+1} error: {e}")
+
+        time.sleep(interval)
+
+    log.warning(f"[facebook] status poll timed out after {max_polls * interval}s")
+    return {"ok": None, "status": "timeout"}
+
+
 def post_facebook_reel(video_path, title, description):
     try:
         file_size = Path(video_path).stat().st_size
         log.info(f"[facebook] initializing reel upload ({file_size / 1024:.0f} KB)")
+
+        # Step 1: Initialize upload
         init_resp = requests.post(
             f"https://graph.facebook.com/v19.0/{FB_PAGE_ID}/video_reels",
             params={"access_token": FB_PAGE_ACCESS_TOKEN},
@@ -727,36 +784,26 @@ def post_facebook_reel(video_path, title, description):
         video_id = init_data["video_id"]
         upload_url = init_data.get("upload_url")
         log.info(f"[facebook] upload initialized, video_id={video_id}")
+        log.info(f"[facebook] init response: {json.dumps(init_data, indent=2)}")
 
-        if upload_url:
-            with open(video_path, "rb") as f:
-                upload_resp = requests.post(
-                    upload_url,
-                    headers={
-                        "Authorization": f"OAuth {FB_PAGE_ACCESS_TOKEN}",
-                        "offset": "0",
-                        "file_size": str(file_size),
-                    },
-                    data=f,
-                    timeout=120,
-                )
-            upload_resp.raise_for_status()
-            log.info("[facebook] video binary uploaded")
-        else:
-            with open(video_path, "rb") as f:
-                upload_resp = requests.post(
-                    f"https://rupload.facebook.com/video-upload/v19.0/{video_id}",
-                    headers={
-                        "Authorization": f"OAuth {FB_PAGE_ACCESS_TOKEN}",
-                        "offset": "0",
-                        "file_size": str(file_size),
-                    },
-                    data=f,
-                    timeout=120,
-                )
-            upload_resp.raise_for_status()
-            log.info("[facebook] video binary uploaded (rupload)")
+        # Step 2: Upload video binary
+        target_url = upload_url or f"https://rupload.facebook.com/video-upload/v19.0/{video_id}"
+        with open(video_path, "rb") as f:
+            upload_resp = requests.post(
+                target_url,
+                headers={
+                    "Authorization": f"OAuth {FB_PAGE_ACCESS_TOKEN}",
+                    "offset": "0",
+                    "file_size": str(file_size),
+                },
+                data=f,
+                timeout=120,
+            )
+        upload_resp.raise_for_status()
+        upload_data = upload_resp.json() if upload_resp.headers.get("content-type", "").startswith("application/json") else {}
+        log.info(f"[facebook] video binary uploaded, response: {upload_data}")
 
+        # Step 3: Publish (finish)
         publish_resp = requests.post(
             f"https://graph.facebook.com/v19.0/{FB_PAGE_ID}/video_reels",
             params={"access_token": FB_PAGE_ACCESS_TOKEN},
@@ -770,13 +817,31 @@ def post_facebook_reel(video_path, title, description):
         )
         publish_resp.raise_for_status()
         pub_data = publish_resp.json()
-        log.info(f"[facebook] reel published! response: {pub_data}")
+        log.info(f"[facebook] finish response: {json.dumps(pub_data, indent=2)}")
+
+        # Step 4: Poll for processing status
+        log.info(f"[facebook] waiting for video processing...")
+        result = check_reel_status(video_id, max_polls=12, interval=10)
+
+        if result["ok"] is True:
+            log.info(f"[facebook] ✓ Reel successfully published! video_id={video_id}")
+        elif result["ok"] is False:
+            log.error(f"[facebook] ✗ Reel FAILED after upload. "
+                      f"Status: {result['status']}, Errors: {result.get('errors', 'unknown')}")
+        else:
+            log.warning(f"[facebook] ⚠ Reel status uncertain (timed out polling). "
+                       f"video_id={video_id} — check manually")
+
         return video_id
 
     except Exception as e:
         log.error(f"[facebook] reel upload failed: {e}")
         if hasattr(e, "response") and e.response is not None:
-            log.error(f"[facebook] response body: {e.response.text}")
+            try:
+                err_body = e.response.json()
+                log.error(f"[facebook] error details: {json.dumps(err_body, indent=2)}")
+            except Exception:
+                log.error(f"[facebook] error body: {e.response.text}")
         return None
 
 
