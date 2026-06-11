@@ -1,8 +1,9 @@
 """
 SciTech Reels Agent
 Generates short vertical videos (Facebook Reels) from top news articles.
-Picks 2-3 best articles per day, renders animated frames, stitches into MP4,
-posts to Facebook as Reels and drops a copy in Telegram promo group.
+Picks 2-3 best articles per day, renders animated frames with article images,
+adds ambient background audio, stitches into MP4, posts to Facebook as Reels
+and drops a copy in Telegram promo group.
 """
 
 import os
@@ -15,13 +16,14 @@ import base64
 import logging
 import requests
 import psycopg2
+import numpy as np
 from datetime import datetime, timedelta
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 from moviepy import (
     ImageClip,
     CompositeVideoClip,
-    TextClip,
+    AudioClip,
     concatenate_videoclips,
     AudioFileClip,
     ColorClip,
@@ -70,6 +72,7 @@ if missing:
 DATA_DIR   = Path(os.getenv("DATA_DIR", ".")).resolve()
 FRAMES_DIR = DATA_DIR / "frames";  FRAMES_DIR.mkdir(parents=True, exist_ok=True)
 REELS_DIR  = DATA_DIR / "reels";   REELS_DIR.mkdir(parents=True, exist_ok=True)
+IMAGES_DIR = DATA_DIR / "images";  IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
 GEMINI_MODEL    = "gemini-2.5-flash"
 GEMINI_TEXT_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
@@ -149,6 +152,60 @@ def _parse_json(raw):
             except Exception:
                 pass
     return None
+
+
+# ── Article Image Fetcher ──
+
+def fetch_article_image(website_url):
+    if not website_url:
+        return None
+    try:
+        resp = requests.get(website_url, timeout=15, headers={
+            "User-Agent": "Mozilla/5.0 (compatible; SciTechReelsBot/1.0)"
+        })
+        resp.raise_for_status()
+        html = resp.text
+        m = re.search(r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
+        if not m:
+            m = re.search(r'<meta\s+content=["\']([^"\']+)["\']\s+property=["\']og:image["\']', html, re.IGNORECASE)
+        if not m:
+            log.info(f"[image] no og:image found on {website_url}")
+            return None
+        img_url = m.group(1)
+        if img_url.startswith("//"):
+            img_url = "https:" + img_url
+        elif img_url.startswith("/"):
+            from urllib.parse import urlparse
+            parsed = urlparse(website_url)
+            img_url = f"{parsed.scheme}://{parsed.netloc}{img_url}"
+
+        img_resp = requests.get(img_url, timeout=20, headers={
+            "User-Agent": "Mozilla/5.0 (compatible; SciTechReelsBot/1.0)"
+        })
+        img_resp.raise_for_status()
+
+        ext = ".jpg"
+        ct = img_resp.headers.get("content-type", "")
+        if "png" in ct:
+            ext = ".png"
+        elif "webp" in ct:
+            ext = ".webp"
+
+        out = IMAGES_DIR / f"article_{datetime.now().strftime('%Y%m%d_%H%M%S')}{ext}"
+        out.write_bytes(img_resp.content)
+        log.info(f"[image] downloaded article image: {out.name} ({len(img_resp.content) / 1024:.0f} KB)")
+        return out
+    except Exception as e:
+        log.warning(f"[image] failed to fetch article image: {e}")
+        return None
+
+
+def _img_to_data_url(path):
+    suffix = Path(path).suffix.lower().lstrip(".") or "jpeg"
+    mime_map = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png", "webp": "webp"}
+    mime = mime_map.get(suffix, "jpeg")
+    with open(path, "rb") as f:
+        return f"data:image/{mime};base64,{base64.b64encode(f.read()).decode()}"
 
 
 # ── Database ──
@@ -231,6 +288,52 @@ Return JSON with these fields:
 Keep all text short — it will be displayed on a vertical video. Shorter = more impactful."""
 
     return gemini_text(prompt, label="reel-script", max_output_tokens=1024)
+
+
+# ── Background Audio ──
+
+def generate_ambient_audio(duration, sr=44100):
+    """Generate a soft ambient news-style background audio using synthesized tones."""
+    t = np.linspace(0, duration, int(sr * duration), endpoint=False)
+
+    # Deep warm pad
+    pad = 0.12 * np.sin(2 * np.pi * 80 * t)
+    pad += 0.08 * np.sin(2 * np.pi * 120 * t)
+    pad += 0.05 * np.sin(2 * np.pi * 160 * t)
+
+    # Shimmering high tone with slow modulation
+    mod = 0.5 + 0.5 * np.sin(2 * np.pi * 0.3 * t)
+    shimmer = 0.04 * np.sin(2 * np.pi * 440 * t) * mod
+    shimmer += 0.03 * np.sin(2 * np.pi * 554 * t) * (1 - mod)
+    shimmer += 0.02 * np.sin(2 * np.pi * 660 * t) * mod
+
+    # Gentle rising tone for urgency/news feel
+    sweep_freq = 200 + 100 * (t / duration)
+    sweep = 0.03 * np.sin(2 * np.pi * sweep_freq * t)
+    sweep *= np.sin(np.pi * t / duration)  # fade in/out envelope
+
+    audio = pad + shimmer + sweep
+
+    # Smooth fade in (1.5s) and fade out (2s)
+    fade_in_samples = int(1.5 * sr)
+    fade_out_samples = int(2.0 * sr)
+    audio[:fade_in_samples] *= np.linspace(0, 1, fade_in_samples)
+    audio[-fade_out_samples:] *= np.linspace(1, 0, fade_out_samples)
+
+    # Normalize
+    peak = np.max(np.abs(audio))
+    if peak > 0:
+        audio = audio / peak * 0.35
+
+    # Stereo
+    stereo = np.column_stack([audio, audio])
+
+    def make_frame(t_arr):
+        indices = (t_arr * sr).astype(int)
+        indices = np.clip(indices, 0, len(stereo) - 1)
+        return stereo[indices]
+
+    return AudioClip(make_frame, duration=duration, fps=sr)
 
 
 # ── Frame Rendering (Playwright) ──
@@ -334,7 +437,59 @@ def render_frame_hook(hook_text, category, accent, glow):
     return html
 
 
+def render_frame_article_image(article_img_path, headline_text, source, category, accent, glow):
+    """Frame that shows the actual article image as full background with headline overlay."""
+    bg_data = _img_to_data_url(article_img_path)
+    hl_len = len(headline_text or "")
+    font_size = 40 if hl_len > 60 else 48 if hl_len > 35 else 56
+    html = f"""<!DOCTYPE html><html dir="rtl" lang="ar"><head><meta charset="utf-8">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Kufi+Arabic:wght@400;700;900&display=swap" rel="stylesheet">
+<style>
+*{{margin:0;padding:0;box-sizing:border-box;}}
+body{{width:{W}px;height:{H}px;overflow:hidden;font-family:'Noto Kufi Arabic',sans-serif;position:relative;background:#000;}}
+.bg{{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;object-position:center;}}
+.overlay{{position:absolute;inset:0;
+  background:linear-gradient(180deg,
+    rgba(0,0,0,0.1) 0%,
+    rgba(0,0,0,0.05) 20%,
+    rgba(0,0,0,0.15) 40%,
+    rgba(0,0,0,0.6) 65%,
+    rgba(0,0,0,0.92) 85%,
+    rgba(0,0,0,0.98) 100%);}}
+.cat-badge{{position:absolute;top:50px;right:50px;background:{accent};color:#000;padding:12px 28px;
+  border-radius:12px;font-weight:900;font-size:22px;letter-spacing:1px;
+  box-shadow:0 4px 20px rgba(0,0,0,0.4);z-index:20;}}
+.source-tag{{position:absolute;top:50px;left:50px;background:rgba(0,0,0,0.65);color:#fff;
+  padding:10px 22px;border-radius:10px;font-weight:700;font-size:16px;
+  backdrop-filter:blur(10px);z-index:20;}}
+.bottom{{position:absolute;bottom:0;left:0;right:0;padding:50px 55px 80px;z-index:15;text-align:right;}}
+.accent-line{{width:80px;height:5px;background:{accent};margin:0 0 20px auto;border-radius:3px;
+  box-shadow:0 0 25px {accent}aa;}}
+.headline{{font-size:{font_size}px;font-weight:900;color:#fff;line-height:1.35;
+  text-shadow:0 3px 20px rgba(0,0,0,0.9);}}
+.domain{{position:absolute;bottom:30px;left:55px;font-size:16px;color:rgba(255,255,255,0.6);
+  font-weight:600;letter-spacing:2px;z-index:20;}}
+.corner-tl,.corner-br{{position:absolute;width:50px;height:50px;z-index:5;}}
+.corner-tl{{top:30px;left:30px;border-top:2px solid {accent}55;border-left:2px solid {accent}55;}}
+.corner-br{{bottom:30px;right:30px;border-bottom:2px solid {accent}55;border-right:2px solid {accent}55;}}
+</style></head><body>
+<img src="{bg_data}" class="bg" alt="bg">
+<div class="overlay"></div>
+<div class="corner-tl"></div>
+<div class="corner-br"></div>
+<div class="source-tag">{_html_esc(source)}</div>
+<div class="cat-badge">{_html_esc(category)}</div>
+<div class="bottom">
+  <div class="accent-line"></div>
+  <div class="headline">{_html_esc(headline_text)}</div>
+</div>
+<div class="domain">scitech.top</div>
+</body></html>"""
+    return html
+
+
 def render_frame_headline(headline_text, accent, glow):
+    """Fallback headline frame when no article image is available."""
     hl_len = len(headline_text or "")
     font_size = 44 if hl_len > 50 else 52 if hl_len > 30 else 60
     html = f"""<!DOCTYPE html><html dir="rtl" lang="ar"><head><meta charset="utf-8">
@@ -347,9 +502,6 @@ def render_frame_headline(headline_text, accent, glow):
   margin-bottom:40px;box-shadow:0 0 30px {accent}88;}}
 .headline{{font-size:{font_size}px;font-weight:900;color:#fff;line-height:1.45;max-width:920px;
   text-shadow:0 4px 40px rgba(0,0,0,0.6), 0 0 60px {accent}22;}}
-.source-tag{{position:absolute;bottom:120px;background:rgba(255,255,255,0.08);backdrop-filter:blur(16px);
-  border:1px solid rgba(255,255,255,0.15);padding:12px 30px;border-radius:50px;
-  font-size:18px;color:rgba(255,255,255,0.8);font-weight:600;}}
 </style></head><body>
 {_bg_divs()}
 <div class="content">
@@ -429,8 +581,9 @@ def render_html_to_png(html, out_path):
         return None
 
 
-def render_all_frames(article, script):
+def render_all_frames(article, script, article_img_path=None):
     category = article.get("category", "Technology")
+    source = article.get("source", "SciTech")
     accent = CATEGORY_COLORS.get(category, "#00e5c0")
 
     glow_map = {
@@ -451,8 +604,14 @@ def render_all_frames(article, script):
     frames_spec = [
         ("intro",    render_frame_intro(accent, glow, logo_b64)),
         ("hook",     render_frame_hook(hook, category, accent, glow)),
-        ("headline", render_frame_headline(headline, accent, glow)),
     ]
+
+    if article_img_path and Path(article_img_path).exists():
+        frames_spec.append(("article", render_frame_article_image(
+            article_img_path, headline, source, category, accent, glow)))
+    else:
+        frames_spec.append(("headline", render_frame_headline(headline, accent, glow)))
+
     if detail:
         frames_spec.append(("detail", render_frame_detail(detail, accent, glow)))
     frames_spec.append(("cta", render_frame_cta(cta, article.get("website_url", ""), accent, glow, logo_b64)))
@@ -492,7 +651,7 @@ def create_reel_video(frame_paths, article_id):
         clip = ImageClip(str(fpath), duration=dur)
         clip = clip.resized((W, H))
         zoom_factor = 1.06
-        clip = clip.resized(lambda t: 1 + (zoom_factor - 1) * (t / dur))
+        clip = clip.resized(lambda t, d=dur: 1 + (zoom_factor - 1) * (t / d))
         clip = clip.with_position("center")
         if i > 0:
             clip = clip.with_effects([vfx.CrossFadeIn(fade)])
@@ -503,13 +662,30 @@ def create_reel_video(frame_paths, article_id):
     final = concatenate_videoclips(clips, method="compose", padding=-fade)
     final = final.resized((W, H))
 
+    total_duration = final.duration
+
+    # Add background audio
+    bgm_path = Path("bgm.mp3")
+    if bgm_path.exists():
+        log.info("[audio] using custom bgm.mp3")
+        audio = AudioFileClip(str(bgm_path)).subclipped(0, min(total_duration, 60))
+        if audio.duration < total_duration:
+            audio = audio.with_effects([vfx.Loop(duration=total_duration)])
+        audio = audio.with_effects([vfx.MultiplyVolume(0.4)])
+    else:
+        log.info("[audio] generating ambient background audio")
+        audio = generate_ambient_audio(total_duration)
+
+    final = final.with_audio(audio)
+
     out_path = REELS_DIR / f"reel_{article_id[:12]}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
 
     final.write_videofile(
         str(out_path),
         fps=30,
         codec="libx264",
-        audio=False,
+        audio_codec="aac",
+        audio_bitrate="128k",
         preset="medium",
         bitrate="4000k",
         logger=None,
@@ -615,7 +791,7 @@ def send_reel_to_telegram(video_path, caption):
 
 def cleanup_old_files(max_age_hours=24):
     cutoff = time.time() - (max_age_hours * 3600)
-    for d in [FRAMES_DIR, REELS_DIR]:
+    for d in [FRAMES_DIR, REELS_DIR, IMAGES_DIR]:
         for f in d.iterdir():
             if f.is_file() and f.stat().st_mtime < cutoff:
                 f.unlink(missing_ok=True)
@@ -647,7 +823,13 @@ def run():
 
         log.info(f"[reels] script: hook='{script.get('hook', '')[:40]}' headline='{script.get('headline', '')[:40]}'")
 
-        frame_paths = render_all_frames(article, script)
+        article_img = fetch_article_image(article.get("website_url"))
+        if article_img:
+            log.info(f"[reels] article image ready: {article_img.name}")
+        else:
+            log.info("[reels] no article image, using styled headline frame")
+
+        frame_paths = render_all_frames(article, script, article_img)
         if len(frame_paths) < 3:
             log.error(f"[reels] only {len(frame_paths)} frames rendered, need at least 3, skipping")
             continue
