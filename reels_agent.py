@@ -19,6 +19,7 @@ import psycopg2
 import numpy as np
 from datetime import datetime, timedelta
 from pathlib import Path
+from PIL import Image as PILImage
 from playwright.sync_api import sync_playwright
 from moviepy import (
     ImageClip,
@@ -184,16 +185,23 @@ def fetch_article_image(website_url):
         })
         img_resp.raise_for_status()
 
-        ext = ".jpg"
-        ct = img_resp.headers.get("content-type", "")
-        if "png" in ct:
-            ext = ".png"
-        elif "webp" in ct:
-            ext = ".webp"
-
-        out = IMAGES_DIR / f"article_{datetime.now().strftime('%Y%m%d_%H%M%S')}{ext}"
-        out.write_bytes(img_resp.content)
-        log.info(f"[image] downloaded article image: {out.name} ({len(img_resp.content) / 1024:.0f} KB)")
+        out = IMAGES_DIR / f"article_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+        # Save raw bytes first, then resize to keep memory low
+        tmp = IMAGES_DIR / f"_tmp_{datetime.now().strftime('%H%M%S')}"
+        tmp.write_bytes(img_resp.content)
+        try:
+            img = PILImage.open(tmp)
+            img = img.convert("RGB")
+            # Resize to max 1080px wide, preserving aspect ratio
+            if img.width > 1080:
+                ratio = 1080 / img.width
+                img = img.resize((1080, int(img.height * ratio)), PILImage.LANCZOS)
+            img.save(str(out), "JPEG", quality=85)
+            tmp.unlink(missing_ok=True)
+        except Exception as e:
+            log.warning(f"[image] resize failed, using raw: {e}")
+            tmp.rename(out)
+        log.info(f"[image] article image ready: {out.name} ({out.stat().st_size / 1024:.0f} KB)")
         return out
     except Exception as e:
         log.warning(f"[image] failed to fetch article image: {e}")
@@ -665,18 +673,24 @@ def create_reel_video(frame_paths, article_id):
     total_duration = final.duration
 
     # Add background audio
-    bgm_path = Path("bgm.mp3")
-    if bgm_path.exists():
-        log.info("[audio] using custom bgm.mp3")
-        audio = AudioFileClip(str(bgm_path)).subclipped(0, min(total_duration, 60))
-        if audio.duration < total_duration:
-            audio = audio.with_effects([vfx.Loop(duration=total_duration)])
-        audio = audio.with_effects([vfx.MultiplyVolume(0.4)])
-    else:
-        log.info("[audio] generating ambient background audio")
-        audio = generate_ambient_audio(total_duration)
+    audio = None
+    try:
+        bgm_path = Path("bgm.mp3")
+        if bgm_path.exists():
+            log.info("[audio] using custom bgm.mp3")
+            audio = AudioFileClip(str(bgm_path)).subclipped(0, min(total_duration, 60))
+            if audio.duration < total_duration:
+                audio = audio.with_effects([vfx.Loop(duration=total_duration)])
+            audio = audio.with_effects([vfx.MultiplyVolume(0.4)])
+        else:
+            log.info("[audio] generating ambient background audio")
+            audio = generate_ambient_audio(total_duration)
+    except Exception as e:
+        log.warning(f"[audio] audio generation failed, continuing without: {e}")
+        audio = None
 
-    final = final.with_audio(audio)
+    if audio is not None:
+        final = final.with_audio(audio)
 
     out_path = REELS_DIR / f"reel_{article_id[:12]}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
 

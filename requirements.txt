@@ -3,3 +3,4 @@ playwright>=1.47.0,<1.48
 psycopg2-binary>=2.9.9
 moviepy>=2.0.0
 numpy>=1.26
+Pillow>=10.0
