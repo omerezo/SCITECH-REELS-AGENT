@@ -637,6 +637,22 @@ def render_all_frames(article, script, article_img_path=None):
     return paths
 
 
+# ── Background Music Selection ──
+
+def _pick_bgm():
+    """Pick a random background music track from bgm/ folder, or fallback to bgm.mp3."""
+    bgm_dir = Path("bgm")
+    if bgm_dir.is_dir():
+        tracks = list(bgm_dir.glob("*.mp3"))
+        if tracks:
+            pick = random.choice(tracks)
+            return pick
+    single = Path("bgm.mp3")
+    if single.exists():
+        return single
+    return None
+
+
 # ── Video Stitching (MoviePy) ──
 
 def create_reel_video(frame_paths, article_id):
@@ -676,9 +692,9 @@ def create_reel_video(frame_paths, article_id):
     # Add background audio
     audio = None
     try:
-        bgm_path = Path("bgm.mp3")
-        if bgm_path.exists():
-            log.info("[audio] using custom bgm.mp3")
+        bgm_path = _pick_bgm()
+        if bgm_path:
+            log.info(f"[audio] using {bgm_path.name}")
             raw_audio = AudioFileClip(str(bgm_path))
             trim_dur = min(total_duration, raw_audio.duration)
             raw_audio = raw_audio.subclipped(0, trim_dur)
