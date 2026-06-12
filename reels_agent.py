@@ -679,10 +679,25 @@ def create_reel_video(frame_paths, article_id):
         bgm_path = Path("bgm.mp3")
         if bgm_path.exists():
             log.info("[audio] using custom bgm.mp3")
-            audio = AudioFileClip(str(bgm_path)).subclipped(0, min(total_duration, 60))
-            if audio.duration < total_duration:
-                audio = audio.with_effects([vfx.Loop(duration=total_duration)])
-            audio = audio.with_effects([vfx.MultiplyVolume(0.4)])
+            raw_audio = AudioFileClip(str(bgm_path))
+            trim_dur = min(total_duration, raw_audio.duration)
+            raw_audio = raw_audio.subclipped(0, trim_dur)
+            # Reduce volume to 40% using a wrapper AudioClip
+            src = raw_audio
+            audio = AudioClip(
+                lambda t: src.get_frame(t) * 0.4,
+                duration=trim_dur,
+                fps=raw_audio.fps or 44100,
+            )
+            # If bgm is shorter than video, pad with silence
+            if trim_dur < total_duration:
+                silence = AudioClip(
+                    lambda t: np.zeros((np.atleast_1d(t).shape[0], 2)),
+                    duration=total_duration - trim_dur,
+                    fps=audio.fps,
+                )
+                from moviepy import concatenate_audioclips
+                audio = concatenate_audioclips([audio, silence])
         else:
             log.info("[audio] generating ambient background audio")
             audio = generate_ambient_audio(total_duration)
@@ -740,8 +755,12 @@ def check_reel_status(video_id, max_polls=10, interval=15):
                      f"published={data.get('published', '?')}")
 
             if video_status == "ready":
-                log.info(f"[facebook] ✓ reel is READY and published!")
-                return {"ok": True, "status": "ready", "data": data}
+                is_published = data.get("published", False)
+                if is_published:
+                    log.info(f"[facebook] ✓ reel is READY and PUBLISHED!")
+                else:
+                    log.warning(f"[facebook] ⚠ reel is READY but published={is_published}")
+                return {"ok": True, "status": "ready", "published": is_published, "data": data}
 
             if video_status == "error":
                 errors = status.get("errors", publishing_phase.get("error", {}))
@@ -810,6 +829,7 @@ def post_facebook_reel(video_path, title, description):
             json={
                 "upload_phase": "finish",
                 "video_id": video_id,
+                "video_state": "PUBLISHED",
                 "title": title[:80],
                 "description": description[:2000],
             },
