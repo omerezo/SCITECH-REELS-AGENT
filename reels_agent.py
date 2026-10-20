@@ -55,15 +55,23 @@ def _load_dotenv(path=".env"):
 
 _load_dotenv()
 
-GEMINI_API_KEY       = os.getenv("GEMINI_API_KEY")
+LOCAL_GATEWAY_URL    = os.getenv("LOCAL_GATEWAY_URL", "http://192.168.3.82:8008").rstrip("/")
+LOCAL_CHAT_URL       = f"{LOCAL_GATEWAY_URL}/api/chat"
+
+GROQ_API_KEY         = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL           = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
+GROQ_FALLBACK_MODEL  = os.getenv("GROQ_FALLBACK_MODEL", "openai/gpt-oss-120b")
+GROQ_API_URL         = "https://api.groq.com/openai/v1/chat/completions"
+
+
 TELEGRAM_BOT_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_PROMO_CHAT  = os.getenv("TELEGRAM_PROMO_CHAT")
 FB_PAGE_ID           = os.getenv("FB_PAGE_ID")
 FB_PAGE_ACCESS_TOKEN = os.getenv("FB_PAGE_ACCESS_TOKEN")
 DATABASE_URL         = os.getenv("DATABASE_URL")
-SITE_DOMAIN          = "scitech.top"
+SITE_DOMAIN          = os.getenv("SITE_DOMAIN", "www.scitech.top")
 
-REQUIRED = ["GEMINI_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_PROMO_CHAT",
+REQUIRED = ["TELEGRAM_BOT_TOKEN", "TELEGRAM_PROMO_CHAT",
             "FB_PAGE_ID", "FB_PAGE_ACCESS_TOKEN", "DATABASE_URL"]
 missing = [k for k in REQUIRED if not os.getenv(k)]
 if missing:
@@ -74,9 +82,6 @@ DATA_DIR   = Path(os.getenv("DATA_DIR", ".")).resolve()
 FRAMES_DIR = DATA_DIR / "frames";  FRAMES_DIR.mkdir(parents=True, exist_ok=True)
 REELS_DIR  = DATA_DIR / "reels";   REELS_DIR.mkdir(parents=True, exist_ok=True)
 IMAGES_DIR = DATA_DIR / "images";  IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-
-GEMINI_MODEL    = "gemini-2.5-flash"
-GEMINI_TEXT_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
 W, H = 1080, 1920  # vertical Reel
 
@@ -93,45 +98,76 @@ CATEGORY_ICONS = {
 }
 
 
-# ── Gemini ──
+# ── Local AI Gateway ──
 
-def gemini_text(prompt, label="gemini", max_output_tokens=2048, retries=2, timeout=120):
-    gen_cfg = {
-        "responseMimeType": "application/json",
-        "maxOutputTokens": max_output_tokens,
-        "temperature": 0.7,
-        "thinkingConfig": {"thinkingBudget": 0},
-    }
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": gen_cfg,
-    }
-    rate_limit_hits = 0
-    attempt = 0
-    while attempt <= retries + rate_limit_hits:
+def _call_gateway_api(url, json_payload, timeout=120):
+    try:
+        return requests.post(url, json=json_payload, timeout=timeout)
+    except requests.exceptions.ConnectionError:
+        if "192.168.3.82" in url:
+            alt_url = url.replace("192.168.3.82", "127.0.0.1")
+            return requests.post(alt_url, json=json_payload, timeout=timeout)
+        elif "127.0.0.1" in url:
+            alt_url = url.replace("127.0.0.1", "192.168.3.82")
+            return requests.post(alt_url, json=json_payload, timeout=timeout)
+        raise
+
+
+def gemini_text(prompt, label="ai", max_output_tokens=1500, retries=2, timeout=60):
+    """Route LLM text requests through Groq API with rate-limit pacing and smart fallback."""
+    if GROQ_API_KEY:
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        effective_max = min(max_output_tokens, 1500)
+        models_to_try = [GROQ_MODEL, GROQ_FALLBACK_MODEL, "openai/gpt-oss-20b"]
+        for current_model in models_to_try:
+            for attempt in range(retries + 1):
+                try:
+                    payload = {
+                        "model": current_model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.4,
+                        "max_tokens": effective_max
+                    }
+                    resp = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=timeout)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        text = data["choices"][0]["message"]["content"]
+                        parsed = _parse_json(text)
+                        if parsed:
+                            return parsed
+                    elif resp.status_code == 429:
+                        reset_s = 8
+                        try:
+                            if "retry-after" in resp.headers:
+                                reset_s = max(2, int(resp.headers["retry-after"]))
+                        except Exception:
+                            pass
+                        log.warning(f"[{label}] Groq 429 on {current_model}. Pausing {reset_s}s...")
+                        time.sleep(reset_s)
+                    else:
+                        log.warning(f"[{label}] Groq HTTP {resp.status_code}: {resp.text[:200]}")
+                except Exception as e:
+                    log.warning(f"[{label}] Groq attempt {attempt+1}: {e}")
+                time.sleep(2)
+
+    # Local AI Gateway fallback (fast-fail if offline)
+    log.warning(f"[{label}] Falling back to local AI gateway...")
+    payload = {"prompt": prompt}
+    for attempt in range(retries + 1):
         try:
-            resp = requests.post(
-                GEMINI_TEXT_URL, params={"key": GEMINI_API_KEY},
-                json=payload, timeout=timeout,
-            )
-            if resp.status_code == 429:
-                rate_limit_hits += 1
-                if rate_limit_hits > 5:
-                    return None
-                time.sleep(min(30 * (2 ** (rate_limit_hits - 1)), 300))
-                continue
+            resp = _call_gateway_api(LOCAL_CHAT_URL, payload, timeout=3)
             resp.raise_for_status()
             data = resp.json()
-            candidates = data.get("candidates", [])
-            if not candidates:
-                attempt += 1; continue
-            parts = candidates[0].get("content", {}).get("parts", [])
-            text = parts[0].get("text", "") if parts else ""
-            return _parse_json(text)
+            text = data.get("response", "")
+            parsed = _parse_json(text)
+            if parsed:
+                return parsed
         except Exception as e:
-            log.error(f"[{label}] attempt {attempt}: {e}")
-            attempt += 1
-            time.sleep(2 ** attempt)
+            log.warning(f"[{label}] Local AI Gateway offline or failed: {e}")
+            break
     return None
 
 
@@ -144,15 +180,16 @@ def _parse_json(raw):
         if clean.lower().startswith("json"):
             clean = clean[4:].strip()
     try:
-        return json.loads(clean)
+        return json.loads(clean, strict=False)
     except Exception:
         m = re.search(r"(\{.*\}|\[.*\])", clean, re.DOTALL)
         if m:
             try:
-                return json.loads(m.group(1))
+                return json.loads(m.group(1), strict=False)
             except Exception:
                 pass
     return None
+
 
 
 # ── Article Image Fetcher ──
